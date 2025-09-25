@@ -207,13 +207,36 @@ async def get_repo_type(
     session: aiohttp.ClientSession,
     repo_name,
 ):
-    # The v1 repositories endpoint can be used to get information about a specific repository.
-    repo_url = f"{nexus_base_url}{REPOSITORY_ROUTE}/{repo_name}"
+    # The beta repositories endpoint returns a list of repositories and may not
+    # support GET-by-name. Query the list and filter by name to obtain the
+    # repository format.
+    repo_url = f"{nexus_base_url}{REPOSITORY_ROUTE}"
     headers = {"accept": "application/json"}
     async with session.get(repo_url, headers=headers) as response:
         if response.status == 200:
             res_json = await response.json()
-            return res_json.get("format")
+            # Expecting a list of repository objects with at least: name, format, type, url
+            if isinstance(res_json, list):
+                for repo in res_json:
+                    if repo.get("name") == repo_name:
+                        return repo.get("format")
+            else:
+                # Some older instances may return an object; attempt to locate repository
+                # defensively if structure differs.
+                repo = None
+                if isinstance(res_json, dict):
+                    # Try common keys that might hold the list
+                    for key in ("items", "data", "results"):
+                        items = res_json.get(key)
+                        if isinstance(items, list):
+                            for r in items:
+                                if r.get("name") == repo_name:
+                                    repo = r
+                                    break
+                            if repo:
+                                break
+                if repo:
+                    return repo.get("format")
         else:
             print(f"Failed to fetch repositories from {repo_url}: {response.status} - {response.reason}")
     print(f"Repository {repo_name!r} not found via beta repositories endpoint.")
