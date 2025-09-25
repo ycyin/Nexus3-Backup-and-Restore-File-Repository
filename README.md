@@ -45,7 +45,7 @@ python scripts download --nexus-base-url http://example.com:8081 --repo-name <re
 The `upload` command uploads components from a local directory to a Nexus repository.
 
 ```bash
-python scripts upload --nexus-base-url http://example.com:8081 --repo-name <repository-name> --username <username> --password <password> --source_directory <path>
+python scripts upload --nexus-base-url http://example.com:8081 --repo-name <repository-name> --username <username> --password <password> --source-directory <path>
 ```
 
 #### Upload Command Options
