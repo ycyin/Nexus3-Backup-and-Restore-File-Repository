@@ -13,44 +13,66 @@ REPOSITORY_ROUTE = "/service/rest/beta/repositories"
 def parse_pom_file(pom_path: Path):
     """
     Parses Maven coordinate information from a POM file.
+    Handles both namespaced and non-namespaced POM files.
     """
     try:
         tree = ET.parse(pom_path)
         root = tree.getroot()
         
-        # Maven POM namespace
-        namespace = {'maven': 'http://maven.apache.org/POM/4.0.0'}
+        # Maven POM namespace - handle default namespace
+        namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
         
-        # Attempt to parse without a namespace (some POM files may not have one)
+        # Check if the root element has a namespace
+        has_namespace = root.tag.startswith('{http://maven.apache.org/POM/4.0.0}')
+        
         def find_text(element_name):
-            # First, try with the namespace
-            elem = root.find(f'maven:{element_name}', namespace)
-            if elem is not None:
-                return elem.text
-            # Then, try without the namespace
-            elem = root.find(element_name)
-            if elem is not None:
-                return elem.text
+            if has_namespace:
+                # Use namespace prefix for namespaced elements
+                elem = root.find(f'm:{element_name}', namespace)
+                if elem is not None:
+                    return elem.text.strip() if elem.text else None
+            else:
+                # Try without namespace for non-namespaced elements
+                elem = root.find(element_name)
+                if elem is not None:
+                    return elem.text.strip() if elem.text else None
             return None
         
+        def find_parent_text(parent_elem, element_name):
+            if parent_elem is None:
+                return None
+            if has_namespace:
+                elem = parent_elem.find(f'm:{element_name}', namespace)
+            else:
+                elem = parent_elem.find(element_name)
+            if elem is not None:
+                return elem.text.strip() if elem.text else None
+            return None
+        
+        # Get direct elements
         group_id = find_text('groupId')
         artifact_id = find_text('artifactId')
         version = find_text('version')
         
         # If the current POM lacks a groupId or version, try to get it from the parent
         if not group_id or not version:
-            parent = root.find('maven:parent', namespace) or root.find('parent')
+            if has_namespace:
+                parent = root.find('m:parent', namespace)
+            else:
+                parent = root.find('parent')
+                
             if parent is not None:
                 if not group_id:
-                    parent_group = parent.find('maven:groupId', namespace) or parent.find('groupId')
-                    if parent_group is not None:
-                        group_id = parent_group.text
+                    parent_group_id = find_parent_text(parent, 'groupId')
+                    if parent_group_id:
+                        group_id = parent_group_id
                 
                 if not version:
-                    parent_version = parent.find('maven:version', namespace) or parent.find('version')
-                    if parent_version is not None:
-                        version = parent_version.text
+                    parent_version = find_parent_text(parent, 'version')
+                    if parent_version:
+                        version = parent_version
         
+        print(f"Parsed POM {pom_path.name}: groupId={group_id}, artifactId={artifact_id}, version={version}")
         return group_id, artifact_id, version
     
     except Exception as e:
@@ -84,16 +106,92 @@ def find_pom_file_for_artifact(artifact_path: Path):
     
     return None
 
+def parse_maven_path(file_path: Path, source_directory: str):
+    """
+    Parses groupId, artifactId, version, and extension from a Maven repository path.
+    Maven repository structure: .../groupId_parts.../artifactId/version/filename
+    Standard structure has 6 levels from repository root to file.
+    Example: ~/.m2/repository/org/springframework/spring/spring-core/5.3.9/spring-core-5.3.9.jar
+    """
+    # Get the path relative to the source directory
+    try:
+        relative_path = file_path.relative_to(Path(source_directory))
+    except ValueError:
+        # If a relative path cannot be obtained, use the absolute path
+        relative_path = file_path
+    
+    # Get all path parts including the filename
+    all_parts = list(relative_path.parts)
+    filename = relative_path.name
+    
+    print(f"Parsing Maven path: {relative_path}")
+    print(f"All path parts: {all_parts}")
+    
+    # Maven standard 6-layer structure from bottom up:
+    # Layer 6: filename
+    # Layer 5: version  
+    # Layer 4: artifactId
+    # Layer 3: groupId part 3 (optional)
+    # Layer 2: groupId part 2 (optional) 
+    # Layer 1: groupId part 1
+    # Anything above layer 6 should be discarded (repository path prefix)
+    
+    if len(all_parts) < 3:
+        raise ValueError(f"Invalid Maven path structure: {relative_path} - need at least 3 parts")
+    
+    # Parse from the end (bottom-up approach):
+    # Last part: filename (layer 6, already extracted)
+    # Second to last: version (layer 5)
+    # Third to last: artifactId (layer 4)
+    # 4th-6th to last: groupId parts (layers 1-3)
+    
+    version = all_parts[-2]  # Layer 5: version
+    artifact_id = all_parts[-3]  # Layer 4: artifactId
+    
+    # GroupId parts are layers 1-3 (positions -6 to -4)
+    # Take only the last 6 parts and extract groupId from positions -6 to -4
+    if len(all_parts) >= 6:
+        # Standard 6-layer structure: take exactly 6 layers
+        maven_parts = all_parts[-6:]
+        group_parts = maven_parts[:-3]  # First 3 parts are groupId
+    elif len(all_parts) >= 4:
+        # Shorter structure: take available groupId parts
+        group_parts = all_parts[:-3]
+    else:
+        # Minimum structure: no groupId parts
+        group_parts = []
+    
+    group_id = ".".join(group_parts) if group_parts else None
+    
+    # Get the extension from the filename
+    if "." in filename:
+        # Handle compound extensions, e.g., .pom.sha1, .jar.md5
+        name_parts = filename.split(".")
+        if len(name_parts) > 2:
+            # For files like .pom.sha1, the extension should be pom.sha1
+            extension = ".".join(name_parts[1:])
+        else:
+            extension = name_parts[-1]
+    else:
+        extension = ""
+    
+    print(f"Parsed Maven coordinates:")
+    print(f"  groupId: {group_id}")
+    print(f"  artifactId: {artifact_id}")
+    print(f"  version: {version}")
+    print(f"  extension: {extension}")
+    
+    return group_id, artifact_id, version, extension
 
 
 
 async def upload_component(session, repo_url, repo_format, source_filename: Path, source_directory: str):
-    print(f"Starting upload: {source_filename}")
+    # print(f"Starting upload: {source_filename}")
     
     # Check file type and skip hash/metadata files
     filename = source_filename.name.lower()
     if any(filename.endswith(ext) for ext in ['.md5', '.sha1', '.sha256', '.sha512', '.asc']):
-        print(f"Skipping hash/signature file: {source_filename}")
+        # print(f"Skipping hash/signature file: {source_filename}")
         return
     
     # Use a 'with' statement to ensure the file handle is properly closed
@@ -121,6 +219,14 @@ async def upload_component(session, repo_url, repo_format, source_filename: Path
                     else:
                         print(f"No POM file found for {source_filename}, skipping Maven coordinate parsing")
                 
+                # If the current file is not a POM file, try to parse the Maven coordinate information from the file path
+                if not all([group_id, artifact_id, version]):
+                    print(f"Incomplete Maven coordinates from POM: groupId={group_id}, artifactId={artifact_id}, version={version}")
+                    path_group_id, path_artifact_id, path_version, _ = parse_maven_path(source_filename, source_directory)
+                    group_id = group_id or path_group_id
+                    artifact_id = artifact_id or path_artifact_id
+                    version = version or path_version
+
                 # Check if complete Maven coordinate information was obtained
                 if not all([group_id, artifact_id, version]):
                     print(f"Incomplete Maven coordinates from POM: groupId={group_id}, artifactId={artifact_id}, version={version}")
