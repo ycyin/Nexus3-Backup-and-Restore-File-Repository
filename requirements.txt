@@ -4,3 +4,4 @@ mypy-extensions
 tabulate
 tqdm
 typer
+pyinstaller
