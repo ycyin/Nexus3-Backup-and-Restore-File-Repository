@@ -156,14 +156,14 @@ def parse_maven_path(file_path: Path, source_directory: str):
 
 
 
-async def upload_component(session, repo_url, repo_format, source_filename: Path, source_directory: str):
+async def upload_component(session, repo_url, repo_format, source_filename: Path, source_directory: str) -> bool | None:
     # print(f"Starting upload: {source_filename}")
     
     # Check file type and skip hash/metadata files
     filename = source_filename.name.lower()
     if any(filename.endswith(ext) for ext in ['.md5', '.sha1', '.sha256', '.sha512', '.asc']):
         # print(f"Skipping hash/signature file: {source_filename}")
-        return
+        return None
     
     # Use a 'with' statement to ensure the file handle is properly closed
     with open(source_filename, "rb") as file_handle:
@@ -202,7 +202,7 @@ async def upload_component(session, repo_url, repo_format, source_filename: Path
                 if not all([group_id, artifact_id, version]):
                     print(f"Incomplete Maven coordinates from POM: groupId={group_id}, artifactId={artifact_id}, version={version}")
                     print(f"Skipping upload for {source_filename} - missing required Maven coordinates")
-                    return  # Skip uploading this file
+                    return False  # Indicate failure due to missing coordinates
                 
                 # Check version policy: SNAPSHOT vs RELEASE
                 is_snapshot = version.endswith('-SNAPSHOT')
@@ -236,7 +236,7 @@ async def upload_component(session, repo_url, repo_format, source_filename: Path
             except Exception as e:
                 print(f"Failed to parse Maven coordinates from POM for {source_filename}: {e}")
                 print(f"Skipping upload for {source_filename}")
-                return  # Skip uploading this file
+                return False  # Indicate failure
         else:
             # Use generic fields for other formats
             data.add_field(
@@ -248,35 +248,41 @@ async def upload_component(session, repo_url, repo_format, source_filename: Path
         
         headers = {"accept": "application/json"}
 
-        async with session.post(repo_url, data=data, headers=headers) as response:
-            if response.status == 204:
-                print(f"Upload {source_filename!r} Successfully!")
-            else:
-                print(f"Upload failed for {source_filename!r}: {response.status} - {response.reason}")
-                # Print response content for debugging
-                try:
-                    error_text = await response.text()
-                    print(f"Error response: {error_text}")
-                    
-                    # Analyze common error types and provide suggestions
-                    if "Version policy mismatch" in error_text:
-                        print("  → SOLUTION: This is a SNAPSHOT vs RELEASE repository policy issue.")
-                        print("  → Check if you're uploading SNAPSHOT versions to a RELEASE-only repository.")
-                    elif "Repository does not allow updating assets" in error_text:
-                        print("  → SOLUTION: Target repository is read-only or doesn't allow updates.")
-                        print("  → Use a different repository or check repository permissions.")
-                    elif "This path is already a hash" in error_text:
-                        print("  → SOLUTION: Hash files (.md5, .sha1) should not be uploaded as assets.")
-                        print("  → This file should have been skipped - check file filtering logic.")
-                    elif response.status == 400:
-                        print("  → SOLUTION: Bad request - check Maven coordinates and file format.")
-                    elif response.status == 403:
-                        print("  → SOLUTION: Permission denied - check authentication and repository access.")
-                    elif response.status == 500:
-                        print("  → SOLUTION: Server error - check Nexus server logs for details.")
+        try:
+            async with session.post(repo_url, data=data, headers=headers) as response:
+                if response.status == 204:
+                    print(f"Upload {source_filename!r} Successfully!")
+                    return True
+                else:
+                    print(f"Upload failed for {source_filename!r}: {response.status} - {response.reason}")
+                    # Print response content for debugging
+                    try:
+                        error_text = await response.text()
+                        print(f"Error response: {error_text}")
                         
-                except Exception as e:
-                    print(f"Could not read error response: {e}")
+                        # Analyze common error types and provide suggestions
+                        if "Version policy mismatch" in error_text:
+                            print("  → SOLUTION: This is a SNAPSHOT vs RELEASE repository policy issue.")
+                            print("  → Check if you're uploading SNAPSHOT versions to a RELEASE-only repository.")
+                        elif "Repository does not allow updating assets" in error_text:
+                            print("  → SOLUTION: Target repository is read-only or doesn't allow updates.")
+                            print("  → Use a different repository or check repository permissions.")
+                        elif "This path is already a hash" in error_text:
+                            print("  → SOLUTION: Hash files (.md5, .sha1) should not be uploaded as assets.")
+                            print("  → This file should have been skipped - check file filtering logic.")
+                        elif response.status == 400:
+                            print("  → SOLUTION: Bad request - check Maven coordinates and file format.")
+                        elif response.status == 403:
+                            print("  → SOLUTION: Permission denied - check authentication and repository access.")
+                        elif response.status == 500:
+                            print("  → SOLUTION: Server error - check Nexus server logs for details.")
+                            
+                    except Exception as e:
+                        print(f"Could not read error response: {e}")
+                    return False
+        except aiohttp.ClientError as e:
+            print(f"Network error during upload of {source_filename!r}: {e}")
+            return False
 
 
 async def get_repo_type(
@@ -454,14 +460,24 @@ async def upload_repository_components(
             # Check the results
             success_count = 0
             error_count = 0
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    print(f"Task {i} failed with exception: {result}")
-                    error_count += 1
-                else:
+            skipped_count = 0
+            for result in results:
+                if result is True:
                     success_count += 1
+                elif result is False:
+                    error_count += 1
+                elif result is None:
+                    skipped_count += 1
+                elif isinstance(result, Exception):
+                    print(f"Task failed with exception: {result}")
+                    error_count += 1
             
-            print(f"Upload completed: {success_count} successful, {error_count} failed")
+            
+            print(f"\n{'='*70}")
+            typer.secho("UPLOAD SUMMARY", fg=typer.colors.YELLOW, bold=True)
+            print(f"Upload completed: {success_count} successful, {error_count} failed, {skipped_count} skipped")
+            print(f"Expected to upload: {effective_files},Expected to skip: {len(hash_files)}")
+            print(f"{'='*70}")
         except Exception as e:
             print(f"Batch upload failed: {e}")
             raise
