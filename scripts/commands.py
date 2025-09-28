@@ -53,6 +53,6 @@ def upload(
     ),
     username: str = typer.Option("admin", help="The username for authentication"),
     password: str = typer.Option("admin123", help="The password for authentication"),
-    source_directory: str = typer.Option("backup", help="The destination for backup"),
+    source_directory: str = typer.Option("backup", help="The source directory for restore"),
 ):
     return asyncio.run(upload_repository_components(nexus_base_url, repo_name, username, password, source_directory))

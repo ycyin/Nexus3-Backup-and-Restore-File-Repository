@@ -1,9 +1,11 @@
 import os
+import re
 import asyncio
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import aiohttp
+import typer
 
 
 COMPONENTS_ROUTE = "/service/rest/v1/components"
@@ -108,72 +110,41 @@ def find_pom_file_for_artifact(artifact_path: Path):
 
 def parse_maven_path(file_path: Path, source_directory: str):
     """
-    Parses groupId, artifactId, version, and extension from a Maven repository path.
-    Maven repository structure: .../groupId_parts.../artifactId/version/filename
-    Standard structure has 6 levels from repository root to file.
-    Example: ~/.m2/repository/org/springframework/spring/spring-core/5.3.9/spring-core-5.3.9.jar
+    Parse Maven coordinates (groupId, artifactId, version, extension) from a file path
+    - The source_directory should be the base path containing the Maven repository structure
+    - Supports multi-level groupId
     """
-    # Get the path relative to the source directory
+
     try:
         relative_path = file_path.relative_to(Path(source_directory))
     except ValueError:
-        # If a relative path cannot be obtained, use the absolute path
-        relative_path = file_path
-    
-    # Get all path parts including the filename
-    all_parts = list(relative_path.parts)
-    filename = relative_path.name
-    
-    print(f"Parsing Maven path: {relative_path}")
-    print(f"All path parts: {all_parts}")
-    
-    # Maven standard 6-layer structure from bottom up:
-    # Layer 6: filename
-    # Layer 5: version  
-    # Layer 4: artifactId
-    # Layer 3: groupId part 3 (optional)
-    # Layer 2: groupId part 2 (optional) 
-    # Layer 1: groupId part 1
-    # Anything above layer 6 should be discarded (repository path prefix)
-    
-    if len(all_parts) < 3:
-        raise ValueError(f"Invalid Maven path structure: {relative_path} - need at least 3 parts")
-    
-    # Parse from the end (bottom-up approach):
-    # Last part: filename (layer 6, already extracted)
-    # Second to last: version (layer 5)
-    # Third to last: artifactId (layer 4)
-    # 4th-6th to last: groupId parts (layers 1-3)
-    
-    version = all_parts[-2]  # Layer 5: version
-    artifact_id = all_parts[-3]  # Layer 4: artifactId
-    
-    # GroupId parts are layers 1-3 (positions -6 to -4)
-    # Take only the last 6 parts and extract groupId from positions -6 to -4
-    if len(all_parts) >= 6:
-        # Standard 6-layer structure: take exactly 6 layers
-        maven_parts = all_parts[-6:]
-        group_parts = maven_parts[:-3]  # First 3 parts are groupId
-    elif len(all_parts) >= 4:
-        # Shorter structure: take available groupId parts
-        group_parts = all_parts[:-3]
-    else:
-        # Minimum structure: no groupId parts
-        group_parts = []
-    
+        # If the file is not under source_directory, we cannot parse it
+        print(f"Warning: File '{file_path}' is not under source directory '{source_directory}'")
+        # Skip
+        return None, None, None, None
+
+    parts = list(relative_path.parts)
+    print(parts)
+    filename = parts[-1]
+
+    if len(parts) < 4:
+        raise ValueError(f"Invalid Maven path: {relative_path}")
+
+    version = parts[-2]
+    artifact_id = parts[-3]
+    group_parts = parts[:-3]
     group_id = ".".join(group_parts) if group_parts else None
-    
-    # Get the extension from the filename
-    if "." in filename:
-        # Handle compound extensions, e.g., .pom.sha1, .jar.md5
-        name_parts = filename.split(".")
-        if len(name_parts) > 2:
-            # For files like .pom.sha1, the extension should be pom.sha1
-            extension = ".".join(name_parts[1:])
-        else:
-            extension = name_parts[-1]
-    else:
-        extension = ""
+
+    # 文件名解析: artifactId-version[-classifier].ext
+    match = re.match(rf"^{artifact_id}-(\d[^-]*)(?:-(.*))?\.(.+)$", filename)
+    if not match:
+        raise ValueError(f"Filename does not match expected pattern: {filename}")
+
+    version_from_file, classifier, extension = match.groups()
+
+    if version_from_file != version:
+        raise ValueError(f"Version mismatch: dir={version}, file={version_from_file}")
+
     
     print(f"Parsed Maven coordinates:")
     print(f"  groupId: {group_id}")
@@ -355,6 +326,52 @@ async def upload_repository_components(
     password: str,
     source_directory: str,
 ):
+    # --- Pre-emptive Path Validation ---
+    source_path = Path(source_directory)
+    
+    # 1. Check if the directory exists
+    if not source_path.exists():
+        print(f"\n{'='*70}")
+        typer.secho("[ERROR] Source directory does not exist!", fg=typer.colors.RED, bold=True)
+        typer.secho(f"Path: {source_directory}", fg=typer.colors.RED)
+        print(f"{'='*70}\n")
+        raise typer.Exit(code=1)
+    
+    if not source_path.is_dir():
+        print(f"\n{'='*70}")
+        typer.secho("[ERROR] Source path is not a directory!", fg=typer.colors.RED, bold=True)
+        typer.secho(f"Path: {source_directory}", fg=typer.colors.RED)
+        print(f"{'='*70}\n")
+        raise typer.Exit(code=1)
+    
+    # 2. Display the path prominently and ask for confirmation
+    print(f"\n{'='*70}")
+    typer.secho("UPLOAD SOURCE DIRECTORY", fg=typer.colors.YELLOW, bold=True)
+    typer.secho(f"{source_directory}", fg=typer.colors.CYAN, bold=True)
+    print(f"{'='*70}")
+    
+    # Provide guidance on expected directory structure
+    print("\n📁 Expected directory structure:")
+    print("   For Maven repositories:")
+    print("     source_directory/")
+    print("     └── com/org/net/...")
+    print("         └── [groupId path]/")
+    print("             └── [artifactId]/")
+    print("                 └── [version]/")
+    print("                     ├── artifact-version.jar")
+    print("                     ├── artifact-version.pom")
+    print("                     └── artifact-version-sources.jar")
+    print("")
+    print("   For other repository types:")
+    print("     source_directory/")
+    print("     └── [your files and folders]")
+    
+    # 3. Ask for user confirmation
+    confirm = typer.confirm("\nDo you confirm this is the correct source directory to upload from?")
+    if not confirm:
+        typer.secho("\nUpload cancelled by user.", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=0)
+
     repo_url = f"{nexus_base_url}{COMPONENTS_ROUTE}?repository={repo_name}"
     auth = aiohttp.BasicAuth(username, password) if username and password else None
 
