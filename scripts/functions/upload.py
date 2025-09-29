@@ -215,18 +215,35 @@ async def upload_component(session, repo_url, repo_format, source_filename: Path
                     if clean_filename.lower().endswith(hash_ext):
                         clean_filename = clean_filename[:-len(hash_ext)]
                 
-                if "." in clean_filename:
-                    extension = clean_filename.split(".")[-1]
+                # Extract extension and classifier from filename
+                extension = ""
+                classifier = ""
+                
+                # Expected format: artifactId-version[-classifier].extension
+                base_pattern = f"^{re.escape(artifact_id)}-{re.escape(version)}"
+                match = re.match(f"{base_pattern}(?:-(.*))?\.(.*)$", clean_filename)
+
+                if match:
+                    c, e = match.groups()
+                    classifier = c if c else ""
+                    extension = e if e else ""
                 else:
-                    extension = ""
-                
-                print(f"Final Maven coordinates: groupId={group_id}, artifactId={artifact_id}, version={version}, extension={extension}")
-                
+                    # Fallback for filenames that don't match the pattern
+                    if "." in clean_filename:
+                        extension = clean_filename.split(".")[-1]
+
+                print(f"Final Maven coordinates: groupId={group_id}, artifactId={artifact_id}, version={version}, extension={extension}, classifier='{classifier}'")
+
                 # Add Maven-specific fields
                 data.add_field("maven2.groupId", group_id)
                 data.add_field("maven2.artifactId", artifact_id)
                 data.add_field("maven2.version", version)
                 data.add_field("maven2.asset1.extension", extension)
+
+                # Add classifier if it exists
+                if classifier:
+                    data.add_field("maven2.asset1.classifier", classifier)
+
                 data.add_field(
                     "maven2.asset1",
                     file_handle,
