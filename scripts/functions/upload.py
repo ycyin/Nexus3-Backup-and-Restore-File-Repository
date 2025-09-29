@@ -256,128 +256,131 @@ async def upload_repository_components(
         if not repo_format:
             raise RuntimeError(f"Could not determine repo format for {repo_name!r}.")
 
-        print("Scanning files...")
+        print("Scanning files and creating upload tasks...")
         
-        # 优化：使用生成器和早期过滤，避免创建大列表
-        asset_files = []
-        hash_files = []
-        skipped_snapshots = []
-        total_count = 0
+        # 统计信息
+        total_files = 0
+        hash_files_count = 0
+        skipped_snapshots_count = 0
+        tasks = []
         
-        for file_path in source_path.rglob("*"):
-            if not file_path.is_file():
-                continue
+        if repo_format.lower() == "maven2":
+            # Maven 仓库：使用深度优先搜索，逐目录处理
+            processed_dirs = set()  # 避免重复处理
+            
+            def process_directory(dir_path):
+                """深度优先处理目录"""
+                nonlocal total_files, hash_files_count, skipped_snapshots_count, tasks
                 
-            total_count += 1
-            
-            # 简单的进度指示
-            if total_count % 1000 == 0:
-                print(f"  Scanned {total_count} files...")
+                if dir_path in processed_dirs:
+                    return
+                processed_dirs.add(dir_path)
+                
+                # 收集当前目录的所有文件
+                dir_files = []
+                for file_path in dir_path.iterdir():
+                    if file_path.is_file():
+                        total_files += 1
+                        
+                        # 进度指示
+                        if total_files % 1000 == 0:
+                            print(f"  Processed {total_files} files...")
+                        
+                        filename_lower = file_path.name.lower()
+                        
+                        # 过滤哈希文件
+                        if any(filename_lower.endswith(ext) for ext in ('.md5', '.sha1', '.sha256', '.sha512', '.asc')):
+                            hash_files_count += 1
+                            continue
+                        
+                        dir_files.append(file_path)
+                
+                # 检查是否为 SNAPSHOT 目录
+                if dir_path.name.endswith('-SNAPSHOT'):
+                    skipped_snapshots_count += len(dir_files)
+                    return
+                
+                # 如果目录有文件，尝试创建上传任务
+                if dir_files:
+                    # 解析组件坐标
+                    pom_file = next((p for p in dir_files if p.name.lower().endswith('.pom')), None)
+                    group_id, artifact_id, version = None, None, None
+                    
+                    if pom_file:
+                        group_id, artifact_id, version = parse_pom_file(pom_file)
 
-            filename_lower = file_path.name.lower()
+                    # 回退到路径解析
+                    if not all([group_id, artifact_id, version]):
+                        try:
+                            g, a, v, _ = parse_maven_path(dir_files[0], source_directory)
+                            group_id = group_id or g
+                            artifact_id = artifact_id or a
+                            version = version or v
+                        except ValueError:
+                            pass
+                    
+                    # 创建上传任务
+                    if all([group_id, artifact_id, version]) and not version.endswith('-SNAPSHOT'):
+                        print(f"Creating task for: {group_id}:{artifact_id}:{version}")
+                        tasks.append(asyncio.create_task(
+                            upload_maven_component_group(session, repo_url, group_id, artifact_id, version, dir_files)
+                        ))
             
-            # 早期过滤哈希文件
-            if any(filename_lower.endswith(ext) for ext in ('.md5', '.sha1', '.sha256', '.sha512', '.asc')):
-                hash_files.append(file_path)
-                continue
-            
-            # 对于 Maven 仓库，跳过 SNAPSHOT 目录中的文件
-            if repo_format.lower() == "maven2":    
-                component_dir = file_path.parent
-                if component_dir.name.endswith('-SNAPSHOT'):
-                    skipped_snapshots.append(file_path)
+            # 深度优先遍历所有目录
+            def dfs_traverse(current_path):
+                """深度优先遍历目录树"""
+                try:
+                    for item in current_path.iterdir():
+                        if item.is_dir():
+                            # 先处理当前目录
+                            process_directory(item)
+                            # 然后递归处理子目录
+                            dfs_traverse(item)
+                except PermissionError:
+                    print(f"Permission denied: {current_path}")
+                    
+            print("Using depth-first search to process Maven components...")
+            dfs_traverse(source_path)
+                        
+        else:
+            # 非 Maven 仓库：逐个文件处理
+            for file_path in source_path.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                    
+                total_files += 1
+                
+                if total_files % 1000 == 0:
+                    print(f"  Scanned {total_files} files...")
+
+                filename_lower = file_path.name.lower()
+                
+                # 过滤哈希文件
+                if any(filename_lower.endswith(ext) for ext in ('.md5', '.sha1', '.sha256', '.sha512', '.asc')):
+                    hash_files_count += 1
                     continue
                 
-            asset_files.append(file_path)
-            
+                # 直接创建上传任务
+                tasks.append(asyncio.create_task(
+                    upload_generic_component(session, repo_url, repo_format, file_path)
+                ))
         
+        # 显示统计信息
         print(f"\n{'='*70}")
-        typer.secho("FILE ANALYSIS", fg=typer.colors.YELLOW, bold=True)
-        print(f"  - Total files found: {total_count}")
-        print(f"  - Asset files to upload: {len(asset_files)}")
-        print(f"  - Hash files to skip: {len(hash_files)}")
-        if skipped_snapshots:
-            print(f" - SNAPSHOT files to skip: {len(skipped_snapshots)}")
+        typer.secho("SCAN & TASK CREATION SUMMARY", fg=typer.colors.YELLOW, bold=True)
+        print(f"  - Total files scanned: {total_files}")
+        print(f"  - Upload tasks created: {len(tasks)}")
+        print(f"  - Hash files skipped: {hash_files_count}")
+        if skipped_snapshots_count > 0:
+            print(f"  - SNAPSHOT files skipped: {skipped_snapshots_count}")
             typer.secho("    NOTE: SNAPSHOT packages require Maven deploy protocol, not REST API.", fg=typer.colors.YELLOW)
         print(f"{'='*70}\n")
-
-        tasks = []
-        if repo_format.lower() == "maven2":
-            # Group assets by component directory (version-level)
-            component_dirs = {p.parent for p in asset_files}
+        
+        if not tasks:
+            print("No upload tasks created.")
+            return
             
-            print(f"Found {len(component_dirs)} potential Maven component directories.")
-            print("Analyzing components...")
-            
-            valid_components = []
-
-            current_count = 0
-            total_count = len(component_dirs)
-            for comp_dir in component_dirs:
-                assets_in_dir = [p for p in asset_files if p.parent == comp_dir]
-                if not assets_in_dir:
-                    continue
-
-                # 只对 RELEASE 版本解析 POM 文件
-                pom_file = next((p for p in assets_in_dir if p.name.lower().endswith('.pom')), None)
-                group_id, artifact_id, version = None, None, None
-                
-                if pom_file:
-                    group_id, artifact_id, version = parse_pom_file(pom_file)
-
-                # 只有在 POM 解析完全失败时才回退到路径解析
-                if not all([group_id, artifact_id, version]):
-                    try:
-                        g, a, v, _ = parse_maven_path(assets_in_dir[0], source_directory)
-                        group_id = group_id or g
-                        artifact_id = artifact_id or a
-                        version = version or v
-                    except ValueError:
-                        # 静默跳过解析失败的目录，减少日志噪音
-                        continue
-                
-                if not all([group_id, artifact_id, version]):
-                    continue
-                
-                current_count += 1
-                print(f"{current_count}/{total_count}: groupId={group_id}, artifactId={artifact_id}, version={version}.Parsed POM or Path.")
-                # 双重检查：如果版本仍然是 SNAPSHOT（防止路径解析的情况）
-                if version.endswith('-SNAPSHOT'):
-                    skipped_snapshots.append(f"{group_id}:{artifact_id}:{version}")
-                    continue
-                
-                valid_components.append((group_id, artifact_id, version, assets_in_dir))
-
-            # Display summary
-            print(f"\n{'='*70}")
-            typer.secho("COMPONENT ANALYSIS", fg=typer.colors.YELLOW, bold=True)
-            print(f"  - Total component directories: {len(component_dirs)}")
-            print(f"  - Valid RELEASE components: {len(valid_components)}")
-            print(f"  - Skipped SNAPSHOT components: {len(skipped_snapshots)}")
-            if skipped_snapshots:
-                print(f"  - Skipped SNAPSHOTs:")
-                for snapshot in skipped_snapshots:
-                    print(f"    • {snapshot}")
-                typer.secho("    NOTE: SNAPSHOT packages require Maven deploy protocol, not REST API.", fg=typer.colors.YELLOW)
-            print(f"{'='*70}")
-            
-            if not valid_components:
-                print("No valid RELEASE components to upload.")
-                return
-            
-            input(f"\nUploading {len(valid_components)} RELEASE components. Press Enter to continue...")
-
-            for group_id, artifact_id, version, assets_in_dir in valid_components:
-                tasks.append(asyncio.create_task(
-                    upload_maven_component_group(session, repo_url, group_id, artifact_id, version, assets_in_dir)
-                ))
-        else:
-            # For other formats, upload one by one
-            input(f"Uploading {len(asset_files)} files individually. Press Enter to continue...")
-            for asset_path in asset_files:
-                tasks.append(asyncio.create_task(
-                    upload_generic_component(session, repo_url, repo_format, asset_path)
-                ))
+        input(f"Ready to execute {len(tasks)} upload tasks. Press Enter to continue...")
 
         print(f"Created {len(tasks)} upload tasks.")
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -387,9 +390,11 @@ async def upload_repository_components(
         
         typer.secho("UPLOAD SUMMARY", fg=typer.colors.YELLOW, bold=True)
         print(f"- Upload tasks: {success_count} successful, {error_count} failed.")
-        print(f"- Expected to upload: {len(asset_files)} asset files.{len(tasks)} upload tasks.")
-        print(f"- Expected to skip: {len(hash_files)} files.{len(skipped_snapshots)} SNAPSHOTs.")
-        typer.secho("    NOTE: SNAPSHOT packages require Maven deploy protocol, not REST API.", fg=typer.colors.YELLOW)
+        print(f"- Total upload tasks executed: {len(tasks)}")
+        print(f"- Hash files skipped: {hash_files_count}")
+        if skipped_snapshots_count > 0:
+            print(f"- SNAPSHOT files skipped: {skipped_snapshots_count}")
+            typer.secho("    NOTE: SNAPSHOT packages require Maven deploy protocol, not REST API.", fg=typer.colors.YELLOW)
 
 async def upload_maven_component_group(session, repo_url, group_id, artifact_id, version, assets):
     print(f"\n=== Uploading RELEASE component: {group_id}:{artifact_id}:{version} ===")
