@@ -3,6 +3,8 @@ import re
 import asyncio
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 import aiohttp
 import typer
@@ -10,6 +12,64 @@ import typer
 
 COMPONENTS_ROUTE = "/service/rest/v1/components"
 REPOSITORY_ROUTE = "/service/rest/beta/repositories"
+
+
+class ProgressTracker:
+    """实时进度跟踪器"""
+    def __init__(self):
+        self.total_files = 0
+        self.processed_files = 0
+        self.hash_files = 0
+        self.snapshot_files = 0
+        self.upload_tasks = 0
+        self.completed_uploads = 0
+        self.failed_uploads = 0
+        self.start_time = time.time()
+        
+    def update_scan_progress(self):
+        """更新扫描进度"""
+        self.processed_files += 1
+        if self.processed_files % 100 == 0:
+            elapsed = time.time() - self.start_time
+            rate = self.processed_files / elapsed if elapsed > 0 else 0
+            print(f"\r📁 Scanned: {self.processed_files} files ({rate:.1f} files/s) | "
+                  f"🚫 Hash: {self.hash_files} | 📸 SNAPSHOT: {self.snapshot_files} | "
+                  f"📤 Tasks: {self.upload_tasks}", end="", flush=True)
+    
+    def update_upload_progress(self, success=True):
+        """更新上传进度"""
+        if success:
+            self.completed_uploads += 1
+        else:
+            self.failed_uploads += 1
+        
+        total_completed = self.completed_uploads + self.failed_uploads
+        if total_completed % 5 == 0 or total_completed == self.upload_tasks:
+            progress = (total_completed / self.upload_tasks * 100) if self.upload_tasks > 0 else 0
+            print(f"\r📤 Upload Progress: {total_completed}/{self.upload_tasks} ({progress:.1f}%) | "
+                  f"✅ Success: {self.completed_uploads} | ❌ Failed: {self.failed_uploads}", 
+                  end="", flush=True)
+    
+    def print_final_summary(self):
+        """打印最终统计"""
+        elapsed = time.time() - self.start_time
+        print(f"\n\n{'='*70}")
+        typer.secho("FINAL SUMMARY", fg=typer.colors.YELLOW, bold=True)
+        print(f"⏱️  Total time: {elapsed:.2f} seconds")
+        print(f"📁 Files processed: {self.processed_files}")
+        print(f"📤 Upload tasks created: {self.upload_tasks}")
+        print(f"✅ Successful uploads: {self.completed_uploads}")
+        print(f"❌ Failed uploads: {self.failed_uploads}")
+        print(f"🚫 Hash files skipped: {self.hash_files}")
+        print(f"📸 SNAPSHOT files skipped: {self.snapshot_files}")
+        if self.upload_tasks > 0:
+            success_rate = (self.completed_uploads / self.upload_tasks * 100)
+            print(f"📊 Success rate: {success_rate:.1f}%")
+        print(f"{'='*70}")
+
+
+# 全局进度跟踪器
+progress = ProgressTracker()
 
 
 def parse_pom_file(pom_path: Path):
@@ -74,7 +134,7 @@ def parse_pom_file(pom_path: Path):
                     if parent_version:
                         version = parent_version
         
-        print(f"Parsed POM {pom_path.name}: groupId={group_id}, artifactId={artifact_id}, version={version}")
+        # print(f"Parsed POM {pom_path.name}: groupId={group_id}, artifactId={artifact_id}, version={version}")
         return group_id, artifact_id, version
     
     except Exception as e:
@@ -146,137 +206,13 @@ def parse_maven_path(file_path: Path, source_directory: str):
         raise ValueError(f"Version mismatch: dir={version}, file={version_from_file}")
 
     
-    print(f"Parsed Maven coordinates:")
-    print(f"  groupId: {group_id}")
-    print(f"  artifactId: {artifact_id}")
-    print(f"  version: {version}")
-    print(f"  extension: {extension}")
+    # print(f"Parsed Maven coordinates:")
+    # print(f"  groupId: {group_id}")
+    # print(f"  artifactId: {artifact_id}")
+    # print(f"  version: {version}")
+    # print(f"  extension: {extension}")
     
     return group_id, artifact_id, version, extension
-
-
-
-async def upload_component(session, repo_url, repo_format, source_filename: Path, source_directory: str):
-    # print(f"Starting upload: {source_filename}")
-    
-    # Check file type and skip hash/metadata files
-    filename = source_filename.name.lower()
-    if any(filename.endswith(ext) for ext in ['.md5', '.sha1', '.sha256', '.sha512', '.asc']):
-        # print(f"Skipping hash/signature file: {source_filename}")
-        return
-    
-    # Use a 'with' statement to ensure the file handle is properly closed
-    with open(source_filename, "rb") as file_handle:
-        data = aiohttp.FormData()
-        
-        if repo_format.lower() == "maven2":
-            # Maven repositories require specific fields, obtained only from the POM file
-            try:
-                group_id = None
-                artifact_id = None
-                version = None
-                
-                # Get accurate coordinate information only from the POM file
-                if source_filename.suffix.lower() == '.pom':
-                    # The current file is the POM file
-                    group_id, artifact_id, version = parse_pom_file(source_filename)
-                    print(f"Parsed from POM file {source_filename}: groupId={group_id}, artifactId={artifact_id}, version={version}")
-                else:
-                    # Find the corresponding POM file
-                    pom_file = find_pom_file_for_artifact(source_filename)
-                    if pom_file:
-                        group_id, artifact_id, version = parse_pom_file(pom_file)
-                        print(f"Parsed from POM file {pom_file}: groupId={group_id}, artifactId={artifact_id}, version={version}")
-                    else:
-                        print(f"No POM file found for {source_filename}, skipping Maven coordinate parsing")
-                
-                # If the current file is not a POM file, try to parse the Maven coordinate information from the file path
-                if not all([group_id, artifact_id, version]):
-                    print(f"Incomplete Maven coordinates from POM: groupId={group_id}, artifactId={artifact_id}, version={version}")
-                    path_group_id, path_artifact_id, path_version, _ = parse_maven_path(source_filename, source_directory)
-                    group_id = group_id or path_group_id
-                    artifact_id = artifact_id or path_artifact_id
-                    version = version or path_version
-
-                # Check if complete Maven coordinate information was obtained
-                if not all([group_id, artifact_id, version]):
-                    print(f"Incomplete Maven coordinates from POM: groupId={group_id}, artifactId={artifact_id}, version={version}")
-                    print(f"Skipping upload for {source_filename} - missing required Maven coordinates")
-                    return  # Skip uploading this file
-                
-                # Check version policy: SNAPSHOT vs RELEASE
-                is_snapshot = version.endswith('-SNAPSHOT')
-                print(f"Version {version} is {'SNAPSHOT' if is_snapshot else 'RELEASE'}")
-                
-                # Get the extension from the filename (excluding hash suffixes)
-                clean_filename = source_filename.name
-                # Remove possible hash suffixes
-                for hash_ext in ['.md5', '.sha1', '.sha256', '.sha512']:
-                    if clean_filename.lower().endswith(hash_ext):
-                        clean_filename = clean_filename[:-len(hash_ext)]
-                
-                if "." in clean_filename:
-                    extension = clean_filename.split(".")[-1]
-                else:
-                    extension = ""
-                
-                print(f"Final Maven coordinates: groupId={group_id}, artifactId={artifact_id}, version={version}, extension={extension}")
-                
-                # Add Maven-specific fields
-                data.add_field("maven2.groupId", group_id)
-                data.add_field("maven2.artifactId", artifact_id)
-                data.add_field("maven2.version", version)
-                data.add_field("maven2.asset1.extension", extension)
-                data.add_field(
-                    "maven2.asset1",
-                    file_handle,
-                    filename=source_filename.name,
-                    content_type="application/octet-stream",
-                )
-            except Exception as e:
-                print(f"Failed to parse Maven coordinates from POM for {source_filename}: {e}")
-                print(f"Skipping upload for {source_filename}")
-                return  # Skip uploading this file
-        else:
-            # Use generic fields for other formats
-            data.add_field(
-                f"{repo_format}.asset",
-                file_handle,
-                filename=source_filename.name,
-                content_type="application/octet-stream",
-            )
-        
-        headers = {"accept": "application/json"}
-
-        async with session.post(repo_url, data=data, headers=headers) as response:
-            if response.status == 204:
-                print(f"Upload {source_filename!r} Successfully!")
-            else:
-                print(f"Upload failed for {source_filename!r}: {response.status} - {response.reason}")
-                # Print response content for debugging
-                try:
-                    error_text = await response.text()
-                    print(f"Error response: {error_text}")
-                    
-                    # Analyze common error types and provide suggestions
-                    if "Version policy mismatch" in error_text:
-                        print("  → SOLUTION: This is a SNAPSHOT vs RELEASE repository policy issue.")
-                        print("  → Check if you're uploading SNAPSHOT versions to a RELEASE-only repository.")
-                    elif "Repository does not allow updating assets" in error_text:
-                        print("  → SOLUTION: Target repository is read-only or doesn't allow updates.")
-                        print("  → Use a different repository or check repository permissions.")
-                    elif "This path is already a hash" in error_text:
-                        print("  → SOLUTION: Hash files (.md5, .sha1) should not be uploaded as assets.")
-                        print("  → This file should have been skipped - check file filtering logic.")
-                    elif response.status == 400:
-                        print("  → SOLUTION: Bad request - check Maven coordinates and file format.")
-                    elif response.status == 403:
-                        print("  → SOLUTION: Permission denied - check authentication and repository access.")
-                    elif response.status == 500:
-                        print("  → SOLUTION: Server error - check Nexus server logs for details.")
-                        
-                except Exception as e:
-                    print(f"Could not read error response: {e}")
 
 
 async def get_repo_type(
@@ -375,93 +311,292 @@ async def upload_repository_components(
     repo_url = f"{nexus_base_url}{COMPONENTS_ROUTE}?repository={repo_name}"
     auth = aiohttp.BasicAuth(username, password) if username and password else None
 
-    # Create a session and get the repo_format outside the loop for a single confirmation
     async with aiohttp.ClientSession(auth=auth) as session:
         repo_format = await get_repo_type(nexus_base_url, session, repo_name)
         if not repo_format:
-            raise RuntimeError(
-                f"Could not determine repository format for {repo_name!r} using {REPOSITORY_ROUTE}."
-            )
+            raise RuntimeError(f"Could not determine repo format for {repo_name!r}.")
+
+        print("🚀 Starting streaming scan and upload...")
         
-        # Collect all files
-        all_components = []
-        for root, dirs, files in os.walk(source_directory):
-            root_path = Path(root)
-            component_path_list = [root_path / Path(x) for x in files]
-            all_components.extend(component_path_list)
+        # 重置全局进度跟踪器
+        global progress
+        progress = ProgressTracker()
         
-        print(f"Total files to upload: {len(all_components)}")
-        # print(f"All component paths: {all_components}")
+        # 并发上传控制
+        semaphore = asyncio.Semaphore(5)  # 减少并发数量，避免session过载
+        active_tasks = []  # 在外层定义，确保所有分支都能访问
         
-        # Analyze file types and version policies
-        pom_files = []
-        jar_files = []
-        hash_files = []
-        snapshot_files = []
-        release_files = []
+        async def upload_with_semaphore(coro):
+            """带信号量控制的上传"""
+            async with semaphore:
+                return await coro
         
-        for component in all_components:
-            filename = component.name.lower()
-            if filename.endswith('.pom'):
-                pom_files.append(component)
-                # Check if it is a SNAPSHOT version
-                if 'snapshot' in filename:
-                    snapshot_files.append(component)
-                else:
-                    release_files.append(component)
-            elif filename.endswith('.jar'):
-                jar_files.append(component)
-                if 'snapshot' in filename:
-                    snapshot_files.append(component)
-                else:
-                    release_files.append(component)
-            elif any(filename.endswith(ext) for ext in ['.md5', '.sha1', '.sha256', '.sha512', '.asc']):
-                hash_files.append(component)
+        if repo_format.lower() == "maven2":
+            # Maven 仓库：使用深度优先搜索，边扫描边上传
+            processed_dirs = set()  # 避免重复处理
+            
+            async def process_directory(dir_path):
+                """深度优先处理目录并立即上传"""
+                nonlocal active_tasks  # 确保可以访问外层的 active_tasks
+                if dir_path in processed_dirs:
+                    return
+                processed_dirs.add(dir_path)
+                
+                # 收集当前目录的所有文件
+                dir_files = []
+                for file_path in dir_path.iterdir():
+                    if file_path.is_file():
+                        progress.update_scan_progress()
+                        
+                        filename_lower = file_path.name.lower()
+                        
+                        # 过滤哈希文件
+                        if any(filename_lower.endswith(ext) for ext in ('.md5', '.sha1', '.sha256', '.sha512', '.asc')):
+                            progress.hash_files += 1
+                            continue
+                        
+                        dir_files.append(file_path)
+                
+                # 检查是否为 SNAPSHOT 目录
+                if dir_path.name.endswith('-SNAPSHOT'):
+                    progress.snapshot_files += len(dir_files)
+                    return
+                
+                # 如果目录有文件，立即创建并启动上传任务
+                if dir_files:
+                    # 解析组件坐标
+                    pom_file = next((p for p in dir_files if p.name.lower().endswith('.pom')), None)
+                    group_id, artifact_id, version = None, None, None
+                    
+                    if pom_file:
+                        group_id, artifact_id, version = parse_pom_file(pom_file)
+
+                    # 回退到路径解析
+                    if not all([group_id, artifact_id, version]):
+                        try:
+                            g, a, v, _ = parse_maven_path(dir_files[0], source_directory)
+                            group_id = group_id or g
+                            artifact_id = artifact_id or a
+                            version = version or v
+                        except ValueError:
+                            pass
+                    
+                    # 立即启动上传任务
+                    if all([group_id, artifact_id, version]) and not version.endswith('-SNAPSHOT'):
+                        progress.upload_tasks += 1
+                        task = asyncio.create_task(upload_with_semaphore(
+                            upload_maven_component_group(session, repo_url, group_id, artifact_id, version, dir_files)
+                        ))
+                        active_tasks.append(task)
+                        
+                        # 控制并发任务数量，避免内存过载
+                        if len(active_tasks) >= 20:  # 减少并发数量
+                            # 等待一些任务完成
+                            done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                            active_tasks = list(pending)
+            
+            # 深度优先遍历所有目录
+            async def dfs_traverse(current_path):
+                """深度优先遍历目录树"""
+                try:
+                    for item in current_path.iterdir():
+                        if item.is_dir():
+                            # 先处理当前目录
+                            await process_directory(item)
+                            # 然后递归处理子目录
+                            await dfs_traverse(item)
+                except PermissionError:
+                    pass
+                    
+            await dfs_traverse(source_path)
+            
+            # 等待所有剩余任务完成
+            if active_tasks:
+                print(f"\n⏳ Waiting for {len(active_tasks)} remaining uploads to complete...")
+                try:
+                    await asyncio.gather(*active_tasks, return_exceptions=True)
+                except Exception as e:
+                    print(f"Error waiting for tasks: {e}")
+                        
+        else:
+            # 非 Maven 仓库：边扫描边上传
+            async def process_generic_files():
+                """处理非 Maven 仓库的文件上传"""
+                nonlocal active_tasks
+                
+                for file_path in source_path.rglob("*"):
+                    if not file_path.is_file():
+                        continue
+                        
+                    progress.update_scan_progress()
+
+                    filename_lower = file_path.name.lower()
+                    
+                    # 过滤哈希文件
+                    if any(filename_lower.endswith(ext) for ext in ('.md5', '.sha1', '.sha256', '.sha512', '.asc')):
+                        progress.hash_files += 1
+                        continue
+                    
+                    # 立即启动上传任务
+                    progress.upload_tasks += 1
+                    task = asyncio.create_task(upload_with_semaphore(
+                        upload_generic_component(session, repo_url, repo_format, file_path)
+                    ))
+                    active_tasks.append(task)
+                    
+                    # 控制并发任务数量
+                    if len(active_tasks) >= 20:  # 减少并发数量
+                        done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                        active_tasks = list(pending)
+                
+                # 等待所有剩余任务完成
+                if active_tasks:
+                    print(f"\n⏳ Waiting for {len(active_tasks)} remaining uploads to complete...")
+                    try:
+                        await asyncio.gather(*active_tasks, return_exceptions=True)
+                    except Exception as e:
+                        print(f"Error waiting for tasks: {e}")
+            
+            await process_generic_files()
         
-        print(f"File analysis:")
-        print(f"  POM files: {len(pom_files)}")
-        print(f"  JAR files: {len(jar_files)}")
-        print(f"  Hash/signature files: {len(hash_files)} (will be skipped)")
-        print(f"  SNAPSHOT versions: {len(snapshot_files)}")
-        print(f"  RELEASE versions: {len(release_files)}")
+        # 确保所有任务都已完成，再关闭session
+        print(f"\n🔄 Ensuring all uploads are complete before closing session...")
         
-        if snapshot_files:
-            print(f"WARNING: Found SNAPSHOT versions. Make sure target repository accepts SNAPSHOT uploads.")
+        # 等待一小段时间，让所有任务有机会完成
+        await asyncio.sleep(2)
         
-        # Confirm only once
-        effective_files = len(all_components) - len(hash_files)
-        input(f"$$$ Uploading {effective_files} files to a {repo_format} repo (skipping {len(hash_files)} hash files). $$$\nPlease press Enter to confirm and continue ...")
-        
-        # Batch upload all files
-        tasks = []
-        for component in all_components:
-            tasks.append(
-                asyncio.create_task(
-                    upload_component(
-                        session,
-                        repo_url,
-                        repo_format,
-                        component,
-                        source_directory,
-                    )
+        # 检查是否还有活跃的任务
+        if active_tasks:
+            print(f"⚠️  Still have {len(active_tasks)} active tasks, forcing completion...")
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*active_tasks, return_exceptions=True),
+                    timeout=30  # 最多等待30秒
                 )
-            )
+            except asyncio.TimeoutError:
+                print("⚠️  Some tasks timed out, but continuing...")
+            except Exception as e:
+                print(f"⚠️  Error in final task completion: {e}")
         
-        print(f"Created {len(tasks)} upload tasks")
+        # 打印最终统计
+        progress.print_final_summary()
+        
+        if progress.snapshot_files > 0:
+            typer.secho("    NOTE: SNAPSHOT packages require Maven deploy protocol, not REST API.", fg=typer.colors.YELLOW)
+
+async def upload_maven_component_group(session, repo_url, group_id, artifact_id, version, assets):
+    global progress
+    
+    # Filter out hash files that shouldn't be uploaded as assets
+    filtered_assets = []
+    for asset in assets:
+        filename = asset.name.lower()
+        if any(filename.endswith(ext) for ext in ['.md5', '.sha1', '.sha256', '.sha512', '.asc']):
+            continue
+        else:
+            filtered_assets.append(asset)
+    
+    if not filtered_assets:
+        progress.update_upload_progress(success=True)
+        return True
+    
+    data = aiohttp.FormData()
+    data.add_field("maven2.groupId", group_id)
+    data.add_field("maven2.artifactId", artifact_id)
+    data.add_field("maven2.version", version)
+    
+    # Track coordinates to detect duplicates
+    coordinates_seen = set()
+
+    for i, asset_path in enumerate(filtered_assets, 1):
+        clean_filename = asset_path.name
+        extension, classifier = "", ""
+        
+        # Extract classifier and extension from filename (RELEASE versions only)
+        pattern = f"^{re.escape(artifact_id)}-{re.escape(version)}(?:-(.*))?\.(.*)$"
+        match = re.match(pattern, clean_filename)
+        if match:
+            classifier, extension = match.groups()
+            classifier = classifier or ""
+        else:
+            # Fallback parsing
+            if '.' in clean_filename:
+                parts = clean_filename.rsplit('.', 1)
+                extension = parts[1]
+                classifier = ""
+
+        # Create coordinate tuple for duplicate detection
+        coordinate = (extension, classifier)
+        if coordinate in coordinates_seen:
+            continue  # Skip duplicates silently
+        else:
+            coordinates_seen.add(coordinate)
+        
+        data.add_field(f"maven2.asset{i}.extension", extension)
+        if classifier:
+            data.add_field(f"maven2.asset{i}.classifier", classifier)
+        
+        file_handle = open(asset_path, "rb")
+        data.add_field(f"maven2.asset{i}", file_handle, filename=asset_path.name, content_type="application/octet-stream")
+
+    try:
+        async with session.post(repo_url, data=data) as response:
+            success = response.status == 204
+            if not success:
+                # 打印详细的错误信息
+                try:
+                    error_text = await response.text()
+                    print(f"\n❌ Upload failed for {group_id}:{artifact_id}:{version}")
+                    print(f"   Status: {response.status} - {response.reason}")
+                    print(f"   Error: {error_text}")
+                    
+                    # 分析常见错误类型并提供解决建议
+                    if "Version policy mismatch" in error_text:
+                        print(f"   💡 Solution: Check repository version policy (SNAPSHOT vs RELEASE)")
+                    elif "Repository does not allow updating assets" in error_text:
+                        print(f"   💡 Solution: Repository is read-only or doesn't allow updates")
+                    elif response.status == 400:
+                        print(f"   💡 Solution: Check Maven coordinates and file format")
+                    elif response.status == 401:
+                        print(f"   💡 Solution: Check authentication credentials")
+                    elif response.status == 403:
+                        print(f"   💡 Solution: Check repository permissions")
+                    elif response.status == 500:
+                        print(f"   💡 Solution: Server error - check Nexus server logs")
+                except Exception as e:
+                    print(f"\n❌ Upload failed for {group_id}:{artifact_id}:{version}")
+                    print(f"   Status: {response.status} - {response.reason}")
+                    print(f"   Could not read error response: {e}")
+            
+            progress.update_upload_progress(success=success)
+            return success
+    except aiohttp.ClientError as e:
+        print(f"\n❌ Network error uploading {group_id}:{artifact_id}:{version}")
+        print(f"   Error: {e}")
+        print(f"   💡 Solution: Check network connection and Nexus server availability")
+        progress.update_upload_progress(success=False)
+        return False
+    except Exception as e:
+        print(f"\n❌ Unexpected error uploading {group_id}:{artifact_id}:{version}")
+        print(f"   Error: {e}")
+        progress.update_upload_progress(success=False)
+        return False
+    finally:
+        for field in data._fields:
+            if isinstance(field[2], aiohttp.payload.IOBasePayload):
+                field[2].value.close()
+
+async def upload_generic_component(session, repo_url, repo_format, asset_path):
+    global progress
+    
+    data = aiohttp.FormData()
+    with open(asset_path, "rb") as file_handle:
+        data.add_field(f"{repo_format}.asset", file_handle, filename=asset_path.name)
         try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Check the results
-            success_count = 0
-            error_count = 0
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    print(f"Task {i} failed with exception: {result}")
-                    error_count += 1
-                else:
-                    success_count += 1
-            
-            print(f"Upload completed: {success_count} successful, {error_count} failed")
-        except Exception as e:
-            print(f"Batch upload failed: {e}")
-            raise
+            async with session.post(repo_url, data=data) as response:
+                success = response.status == 204
+                progress.update_upload_progress(success=success)
+                return success
+        except aiohttp.ClientError as e:
+            progress.update_upload_progress(success=False)
+            return False

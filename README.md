@@ -60,6 +60,42 @@ python scripts upload --nexus-base-url http://example.com:8081 --repo-name <repo
 
 In these commands, replace `http://example.com:8081`, `<repository-name>`, `<username>`, `<password>`, and `<path>` with your Nexus server URL, repository name, username, password, and the path to the local directory, respectively.
 
+#### Important Notes for `upload` Command
+
+When using the `upload` command, the tool will perform the following steps to ensure correctness:
+
+1.  **Directory Validation**: It first checks if the provided `--source-directory` exists and is a valid directory.
+2.  **User Confirmation**: Before starting the upload, it will prominently display the source directory and ask for your confirmation. This is a crucial step to prevent accidental uploads from the wrong location.
+
+    ```
+    ======================================================================
+    UPLOAD SOURCE DIRECTORY
+    /path/to/your/backup/repository/maven-releases
+    ======================================================================
+
+    📁 Expected directory structure:
+       For Maven repositories:
+         source_directory/
+         └── com/org/net/...
+             └── [groupId path]/
+                 └── [artifactId]/
+                     └── [version]/
+                         ├── artifact-version.jar
+                         ├── artifact-version.pom
+                         └── artifact-version-sources.jar
+
+       For other repository types:
+         source_directory/
+         └── [your files and folders]
+
+    Do you confirm this is the correct source directory to upload from? [y/N]: y
+    ```
+
+3.  **Maven Coordinate Parsing**: For Maven repositories, the tool uses a **POM-first** strategy:
+
+    *   **Primary Method (Recommended)**: It first searches for a corresponding `.pom` file for each artifact. If found, it parses the `groupId`, `artifactId`, and `version` directly from the POM file, which is the most accurate source of information.
+    *   **Fallback Method**: **Only if a `.pom` file is not found**, the tool will fall back to parsing the coordinates from the directory structure relative to the `--source-directory`. For this to work, it is essential that your source directory contains the standard Maven layout (e.g., `com/mycompany/app/1.0/...`).
+
 ## Building Standalone Executables
 
 You can build standalone executables that don't require Python to be installed on the target machine. This makes it easy to distribute and run the tool on systems without Python environments.
