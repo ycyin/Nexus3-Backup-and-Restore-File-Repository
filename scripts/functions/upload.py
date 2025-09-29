@@ -3,6 +3,8 @@ import re
 import asyncio
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 import aiohttp
 import typer
@@ -10,6 +12,64 @@ import typer
 
 COMPONENTS_ROUTE = "/service/rest/v1/components"
 REPOSITORY_ROUTE = "/service/rest/beta/repositories"
+
+
+class ProgressTracker:
+    """实时进度跟踪器"""
+    def __init__(self):
+        self.total_files = 0
+        self.processed_files = 0
+        self.hash_files = 0
+        self.snapshot_files = 0
+        self.upload_tasks = 0
+        self.completed_uploads = 0
+        self.failed_uploads = 0
+        self.start_time = time.time()
+        
+    def update_scan_progress(self):
+        """更新扫描进度"""
+        self.processed_files += 1
+        if self.processed_files % 100 == 0:
+            elapsed = time.time() - self.start_time
+            rate = self.processed_files / elapsed if elapsed > 0 else 0
+            print(f"\r📁 Scanned: {self.processed_files} files ({rate:.1f} files/s) | "
+                  f"🚫 Hash: {self.hash_files} | 📸 SNAPSHOT: {self.snapshot_files} | "
+                  f"📤 Tasks: {self.upload_tasks}", end="", flush=True)
+    
+    def update_upload_progress(self, success=True):
+        """更新上传进度"""
+        if success:
+            self.completed_uploads += 1
+        else:
+            self.failed_uploads += 1
+        
+        total_completed = self.completed_uploads + self.failed_uploads
+        if total_completed % 5 == 0 or total_completed == self.upload_tasks:
+            progress = (total_completed / self.upload_tasks * 100) if self.upload_tasks > 0 else 0
+            print(f"\r📤 Upload Progress: {total_completed}/{self.upload_tasks} ({progress:.1f}%) | "
+                  f"✅ Success: {self.completed_uploads} | ❌ Failed: {self.failed_uploads}", 
+                  end="", flush=True)
+    
+    def print_final_summary(self):
+        """打印最终统计"""
+        elapsed = time.time() - self.start_time
+        print(f"\n\n{'='*70}")
+        typer.secho("FINAL SUMMARY", fg=typer.colors.YELLOW, bold=True)
+        print(f"⏱️  Total time: {elapsed:.2f} seconds")
+        print(f"📁 Files processed: {self.processed_files}")
+        print(f"📤 Upload tasks created: {self.upload_tasks}")
+        print(f"✅ Successful uploads: {self.completed_uploads}")
+        print(f"❌ Failed uploads: {self.failed_uploads}")
+        print(f"🚫 Hash files skipped: {self.hash_files}")
+        print(f"📸 SNAPSHOT files skipped: {self.snapshot_files}")
+        if self.upload_tasks > 0:
+            success_rate = (self.completed_uploads / self.upload_tasks * 100)
+            print(f"📊 Success rate: {success_rate:.1f}%")
+        print(f"{'='*70}")
+
+
+# 全局进度跟踪器
+progress = ProgressTracker()
 
 
 def parse_pom_file(pom_path: Path):
@@ -74,7 +134,7 @@ def parse_pom_file(pom_path: Path):
                     if parent_version:
                         version = parent_version
         
-        print(f"Parsed POM {pom_path.name}: groupId={group_id}, artifactId={artifact_id}, version={version}")
+        # print(f"Parsed POM {pom_path.name}: groupId={group_id}, artifactId={artifact_id}, version={version}")
         return group_id, artifact_id, version
     
     except Exception as e:
@@ -146,11 +206,11 @@ def parse_maven_path(file_path: Path, source_directory: str):
         raise ValueError(f"Version mismatch: dir={version}, file={version_from_file}")
 
     
-    print(f"Parsed Maven coordinates:")
-    print(f"  groupId: {group_id}")
-    print(f"  artifactId: {artifact_id}")
-    print(f"  version: {version}")
-    print(f"  extension: {extension}")
+    # print(f"Parsed Maven coordinates:")
+    # print(f"  groupId: {group_id}")
+    # print(f"  artifactId: {artifact_id}")
+    # print(f"  version: {version}")
+    # print(f"  extension: {extension}")
     
     return group_id, artifact_id, version, extension
 
@@ -256,22 +316,28 @@ async def upload_repository_components(
         if not repo_format:
             raise RuntimeError(f"Could not determine repo format for {repo_name!r}.")
 
-        print("Scanning files and creating upload tasks...")
+        print("🚀 Starting streaming scan and upload...")
         
-        # 统计信息
-        total_files = 0
-        hash_files_count = 0
-        skipped_snapshots_count = 0
-        tasks = []
+        # 重置全局进度跟踪器
+        global progress
+        progress = ProgressTracker()
+        
+        # 并发上传控制
+        semaphore = asyncio.Semaphore(5)  # 减少并发数量，避免session过载
+        active_tasks = []  # 在外层定义，确保所有分支都能访问
+        
+        async def upload_with_semaphore(coro):
+            """带信号量控制的上传"""
+            async with semaphore:
+                return await coro
         
         if repo_format.lower() == "maven2":
-            # Maven 仓库：使用深度优先搜索，逐目录处理
+            # Maven 仓库：使用深度优先搜索，边扫描边上传
             processed_dirs = set()  # 避免重复处理
             
-            def process_directory(dir_path):
-                """深度优先处理目录"""
-                nonlocal total_files, hash_files_count, skipped_snapshots_count, tasks
-                
+            async def process_directory(dir_path):
+                """深度优先处理目录并立即上传"""
+                nonlocal active_tasks  # 确保可以访问外层的 active_tasks
                 if dir_path in processed_dirs:
                     return
                 processed_dirs.add(dir_path)
@@ -280,27 +346,23 @@ async def upload_repository_components(
                 dir_files = []
                 for file_path in dir_path.iterdir():
                     if file_path.is_file():
-                        total_files += 1
-                        
-                        # 进度指示
-                        if total_files % 1000 == 0:
-                            print(f"  Processed {total_files} files...")
+                        progress.update_scan_progress()
                         
                         filename_lower = file_path.name.lower()
                         
                         # 过滤哈希文件
                         if any(filename_lower.endswith(ext) for ext in ('.md5', '.sha1', '.sha256', '.sha512', '.asc')):
-                            hash_files_count += 1
+                            progress.hash_files += 1
                             continue
                         
                         dir_files.append(file_path)
                 
                 # 检查是否为 SNAPSHOT 目录
                 if dir_path.name.endswith('-SNAPSHOT'):
-                    skipped_snapshots_count += len(dir_files)
+                    progress.snapshot_files += len(dir_files)
                     return
                 
-                # 如果目录有文件，尝试创建上传任务
+                # 如果目录有文件，立即创建并启动上传任务
                 if dir_files:
                     # 解析组件坐标
                     pom_file = next((p for p in dir_files if p.name.lower().endswith('.pom')), None)
@@ -319,101 +381,124 @@ async def upload_repository_components(
                         except ValueError:
                             pass
                     
-                    # 创建上传任务
+                    # 立即启动上传任务
                     if all([group_id, artifact_id, version]) and not version.endswith('-SNAPSHOT'):
-                        print(f"Creating task for: {group_id}:{artifact_id}:{version}")
-                        tasks.append(asyncio.create_task(
+                        progress.upload_tasks += 1
+                        task = asyncio.create_task(upload_with_semaphore(
                             upload_maven_component_group(session, repo_url, group_id, artifact_id, version, dir_files)
                         ))
+                        active_tasks.append(task)
+                        
+                        # 控制并发任务数量，避免内存过载
+                        if len(active_tasks) >= 20:  # 减少并发数量
+                            # 等待一些任务完成
+                            done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                            active_tasks = list(pending)
             
             # 深度优先遍历所有目录
-            def dfs_traverse(current_path):
+            async def dfs_traverse(current_path):
                 """深度优先遍历目录树"""
                 try:
                     for item in current_path.iterdir():
                         if item.is_dir():
                             # 先处理当前目录
-                            process_directory(item)
+                            await process_directory(item)
                             # 然后递归处理子目录
-                            dfs_traverse(item)
+                            await dfs_traverse(item)
                 except PermissionError:
-                    print(f"Permission denied: {current_path}")
+                    pass
                     
-            print("Using depth-first search to process Maven components...")
-            dfs_traverse(source_path)
+            await dfs_traverse(source_path)
+            
+            # 等待所有剩余任务完成
+            if active_tasks:
+                print(f"\n⏳ Waiting for {len(active_tasks)} remaining uploads to complete...")
+                try:
+                    await asyncio.gather(*active_tasks, return_exceptions=True)
+                except Exception as e:
+                    print(f"Error waiting for tasks: {e}")
                         
         else:
-            # 非 Maven 仓库：逐个文件处理
-            for file_path in source_path.rglob("*"):
-                if not file_path.is_file():
-                    continue
+            # 非 Maven 仓库：边扫描边上传
+            async def process_generic_files():
+                """处理非 Maven 仓库的文件上传"""
+                nonlocal active_tasks
+                
+                for file_path in source_path.rglob("*"):
+                    if not file_path.is_file():
+                        continue
+                        
+                    progress.update_scan_progress()
+
+                    filename_lower = file_path.name.lower()
                     
-                total_files += 1
+                    # 过滤哈希文件
+                    if any(filename_lower.endswith(ext) for ext in ('.md5', '.sha1', '.sha256', '.sha512', '.asc')):
+                        progress.hash_files += 1
+                        continue
+                    
+                    # 立即启动上传任务
+                    progress.upload_tasks += 1
+                    task = asyncio.create_task(upload_with_semaphore(
+                        upload_generic_component(session, repo_url, repo_format, file_path)
+                    ))
+                    active_tasks.append(task)
+                    
+                    # 控制并发任务数量
+                    if len(active_tasks) >= 20:  # 减少并发数量
+                        done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                        active_tasks = list(pending)
                 
-                if total_files % 1000 == 0:
-                    print(f"  Scanned {total_files} files...")
-
-                filename_lower = file_path.name.lower()
-                
-                # 过滤哈希文件
-                if any(filename_lower.endswith(ext) for ext in ('.md5', '.sha1', '.sha256', '.sha512', '.asc')):
-                    hash_files_count += 1
-                    continue
-                
-                # 直接创建上传任务
-                tasks.append(asyncio.create_task(
-                    upload_generic_component(session, repo_url, repo_format, file_path)
-                ))
-        
-        # 显示统计信息
-        print(f"\n{'='*70}")
-        typer.secho("SCAN & TASK CREATION SUMMARY", fg=typer.colors.YELLOW, bold=True)
-        print(f"  - Total files scanned: {total_files}")
-        print(f"  - Upload tasks created: {len(tasks)}")
-        print(f"  - Hash files skipped: {hash_files_count}")
-        if skipped_snapshots_count > 0:
-            print(f"  - SNAPSHOT files skipped: {skipped_snapshots_count}")
-            typer.secho("    NOTE: SNAPSHOT packages require Maven deploy protocol, not REST API.", fg=typer.colors.YELLOW)
-        print(f"{'='*70}\n")
-        
-        if not tasks:
-            print("No upload tasks created.")
-            return
+                # 等待所有剩余任务完成
+                if active_tasks:
+                    print(f"\n⏳ Waiting for {len(active_tasks)} remaining uploads to complete...")
+                    try:
+                        await asyncio.gather(*active_tasks, return_exceptions=True)
+                    except Exception as e:
+                        print(f"Error waiting for tasks: {e}")
             
-        input(f"Ready to execute {len(tasks)} upload tasks. Press Enter to continue...")
-
-        print(f"Created {len(tasks)} upload tasks.")
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            await process_generic_files()
         
-        success_count = sum(1 for r in results if r is True)
-        error_count = sum(1 for r in results if r is False or isinstance(r, Exception))
+        # 确保所有任务都已完成，再关闭session
+        print(f"\n🔄 Ensuring all uploads are complete before closing session...")
         
-        typer.secho("UPLOAD SUMMARY", fg=typer.colors.YELLOW, bold=True)
-        print(f"- Upload tasks: {success_count} successful, {error_count} failed.")
-        print(f"- Total upload tasks executed: {len(tasks)}")
-        print(f"- Hash files skipped: {hash_files_count}")
-        if skipped_snapshots_count > 0:
-            print(f"- SNAPSHOT files skipped: {skipped_snapshots_count}")
+        # 等待一小段时间，让所有任务有机会完成
+        await asyncio.sleep(2)
+        
+        # 检查是否还有活跃的任务
+        if active_tasks:
+            print(f"⚠️  Still have {len(active_tasks)} active tasks, forcing completion...")
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*active_tasks, return_exceptions=True),
+                    timeout=30  # 最多等待30秒
+                )
+            except asyncio.TimeoutError:
+                print("⚠️  Some tasks timed out, but continuing...")
+            except Exception as e:
+                print(f"⚠️  Error in final task completion: {e}")
+        
+        # 打印最终统计
+        progress.print_final_summary()
+        
+        if progress.snapshot_files > 0:
             typer.secho("    NOTE: SNAPSHOT packages require Maven deploy protocol, not REST API.", fg=typer.colors.YELLOW)
 
 async def upload_maven_component_group(session, repo_url, group_id, artifact_id, version, assets):
-    print(f"\n=== Uploading RELEASE component: {group_id}:{artifact_id}:{version} ===")
-    print(f"All files in this group: {[a.name for a in assets]}")
+    global progress
     
     # Filter out hash files that shouldn't be uploaded as assets
     filtered_assets = []
     for asset in assets:
         filename = asset.name.lower()
         if any(filename.endswith(ext) for ext in ['.md5', '.sha1', '.sha256', '.sha512', '.asc']):
-            print(f"Skipping hash file: {asset.name}")
+            continue
         else:
             filtered_assets.append(asset)
     
     if not filtered_assets:
-        print("No assets to upload after filtering hash files")
+        progress.update_upload_progress(success=True)
         return True
-        
-    print(f"Assets to upload: {[a.name for a in filtered_assets]}")
     
     data = aiohttp.FormData()
     data.add_field("maven2.groupId", group_id)
@@ -443,11 +528,9 @@ async def upload_maven_component_group(session, repo_url, group_id, artifact_id,
         # Create coordinate tuple for duplicate detection
         coordinate = (extension, classifier)
         if coordinate in coordinates_seen:
-            print(f"WARNING: Duplicate coordinates detected! Asset {i} ({clean_filename}) has same coordinates as previous asset: extension='{extension}', classifier='{classifier}'")
+            continue  # Skip duplicates silently
         else:
             coordinates_seen.add(coordinate)
-        
-        print(f"Asset {i}: {clean_filename} -> extension='{extension}', classifier='{classifier}' (coordinate: {coordinate})")
         
         data.add_field(f"maven2.asset{i}.extension", extension)
         if classifier:
@@ -458,15 +541,45 @@ async def upload_maven_component_group(session, repo_url, group_id, artifact_id,
 
     try:
         async with session.post(repo_url, data=data) as response:
-            if response.status == 204:
-                print(f"Successfully uploaded component {group_id}:{artifact_id}:{version}")
-                return True
-            else:
-                error_text = await response.text()
-                print(f"Failed to upload {group_id}:{artifact_id}:{version}. Status: {response.status}, Error: {error_text}")
-                return False
+            success = response.status == 204
+            if not success:
+                # 打印详细的错误信息
+                try:
+                    error_text = await response.text()
+                    print(f"\n❌ Upload failed for {group_id}:{artifact_id}:{version}")
+                    print(f"   Status: {response.status} - {response.reason}")
+                    print(f"   Error: {error_text}")
+                    
+                    # 分析常见错误类型并提供解决建议
+                    if "Version policy mismatch" in error_text:
+                        print(f"   💡 Solution: Check repository version policy (SNAPSHOT vs RELEASE)")
+                    elif "Repository does not allow updating assets" in error_text:
+                        print(f"   💡 Solution: Repository is read-only or doesn't allow updates")
+                    elif response.status == 400:
+                        print(f"   💡 Solution: Check Maven coordinates and file format")
+                    elif response.status == 401:
+                        print(f"   💡 Solution: Check authentication credentials")
+                    elif response.status == 403:
+                        print(f"   💡 Solution: Check repository permissions")
+                    elif response.status == 500:
+                        print(f"   💡 Solution: Server error - check Nexus server logs")
+                except Exception as e:
+                    print(f"\n❌ Upload failed for {group_id}:{artifact_id}:{version}")
+                    print(f"   Status: {response.status} - {response.reason}")
+                    print(f"   Could not read error response: {e}")
+            
+            progress.update_upload_progress(success=success)
+            return success
     except aiohttp.ClientError as e:
-        print(f"Network error uploading {group_id}:{artifact_id}:{version}: {e}")
+        print(f"\n❌ Network error uploading {group_id}:{artifact_id}:{version}")
+        print(f"   Error: {e}")
+        print(f"   💡 Solution: Check network connection and Nexus server availability")
+        progress.update_upload_progress(success=False)
+        return False
+    except Exception as e:
+        print(f"\n❌ Unexpected error uploading {group_id}:{artifact_id}:{version}")
+        print(f"   Error: {e}")
+        progress.update_upload_progress(success=False)
         return False
     finally:
         for field in data._fields:
@@ -474,17 +587,16 @@ async def upload_maven_component_group(session, repo_url, group_id, artifact_id,
                 field[2].value.close()
 
 async def upload_generic_component(session, repo_url, repo_format, asset_path):
+    global progress
+    
     data = aiohttp.FormData()
     with open(asset_path, "rb") as file_handle:
         data.add_field(f"{repo_format}.asset", file_handle, filename=asset_path.name)
         try:
             async with session.post(repo_url, data=data) as response:
-                if response.status == 204:
-                    print(f"Successfully uploaded {asset_path.name}")
-                    return True
-                else:
-                    print(f"Failed to upload {asset_path.name}: {response.status}")
-                    return False
+                success = response.status == 204
+                progress.update_upload_progress(success=success)
+                return success
         except aiohttp.ClientError as e:
-            print(f"Network error uploading {asset_path.name}: {e}")
+            progress.update_upload_progress(success=False)
             return False
