@@ -398,103 +398,205 @@ async def upload_repository_components(
     repo_url = f"{nexus_base_url}{COMPONENTS_ROUTE}?repository={repo_name}"
     auth = aiohttp.BasicAuth(username, password) if username and password else None
 
-    # Create a session and get the repo_format outside the loop for a single confirmation
     async with aiohttp.ClientSession(auth=auth) as session:
         repo_format = await get_repo_type(nexus_base_url, session, repo_name)
         if not repo_format:
-            raise RuntimeError(
-                f"Could not determine repository format for {repo_name!r} using {REPOSITORY_ROUTE}."
-            )
-        
-        # Collect all files
-        all_components = []
-        for root, dirs, files in os.walk(source_directory):
-            root_path = Path(root)
-            component_path_list = [root_path / Path(x) for x in files]
-            all_components.extend(component_path_list)
-        
-        print(f"Total files to upload: {len(all_components)}")
-        # print(f"All component paths: {all_components}")
-        
-        # Analyze file types and version policies
-        pom_files = []
-        jar_files = []
-        hash_files = []
-        snapshot_files = []
-        release_files = []
-        
-        for component in all_components:
-            filename = component.name.lower()
-            if filename.endswith('.pom'):
-                pom_files.append(component)
-                # Check if it is a SNAPSHOT version
-                if 'snapshot' in filename:
-                    snapshot_files.append(component)
-                else:
-                    release_files.append(component)
-            elif filename.endswith('.jar'):
-                jar_files.append(component)
-                if 'snapshot' in filename:
-                    snapshot_files.append(component)
-                else:
-                    release_files.append(component)
-            elif any(filename.endswith(ext) for ext in ['.md5', '.sha1', '.sha256', '.sha512', '.asc']):
-                hash_files.append(component)
-        
-        print(f"File analysis:")
-        print(f"  POM files: {len(pom_files)}")
-        print(f"  JAR files: {len(jar_files)}")
-        print(f"  Hash/signature files: {len(hash_files)} (will be skipped)")
-        print(f"  SNAPSHOT versions: {len(snapshot_files)}")
-        print(f"  RELEASE versions: {len(release_files)}")
-        
-        if snapshot_files:
-            print(f"WARNING: Found SNAPSHOT versions. Make sure target repository accepts SNAPSHOT uploads.")
-        
-        # Confirm only once
-        effective_files = len(all_components) - len(hash_files)
-        input(f"$$$ Uploading {effective_files} files to a {repo_format} repo (skipping {len(hash_files)} hash files). $$$\nPlease press Enter to confirm and continue ...")
-        
-        # Batch upload all files
+            raise RuntimeError(f"Could not determine repo format for {repo_name!r}.")
+
+        all_files = [p for p in source_path.rglob("*") if p.is_file()]
+        hash_files = {f for f in all_files if f.name.lower().endswith(('.md5', '.sha1', '.sha256', '.sha512', '.asc'))}
+        asset_files = [f for f in all_files if f not in hash_files]
+
+        # --- File Analysis and Statistics ---
+        pom_files = [f for f in asset_files if f.name.lower().endswith('.pom')]
+        snapshot_count = sum(1 for f in asset_files if 'snapshot' in f.name.lower())
+        print(f"\n{'='*70}")
+        typer.secho("FILE ANALYSIS", fg=typer.colors.YELLOW, bold=True)
+        print(f"  - Total files found: {len(all_files)}")
+        print(f"  - Asset files to upload: {len(asset_files)}")
+        print(f"  - Hash files to skip: {len(hash_files)}")
+        print(f"  - POM files: {len(pom_files)}")
+        print(f"  - SNAPSHOT versions detected: {snapshot_count}")
+        if snapshot_count > 0:
+            typer.secho("    WARNING: Ensure the target repository's version policy is set to 'SNAPSHOT'.", fg=typer.colors.YELLOW)
+        print(f"{'='*70}\n")
+
         tasks = []
-        for component in all_components:
-            tasks.append(
-                asyncio.create_task(
-                    upload_component(
-                        session,
-                        repo_url,
-                        repo_format,
-                        component,
-                        source_directory,
-                    )
-                )
-            )
-        
-        print(f"Created {len(tasks)} upload tasks")
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        if repo_format.lower() == "maven2":
+            # Group assets by component directory (version-level)
+            component_dirs = {p.parent for p in asset_files}
             
-            # Check the results
-            success_count = 0
-            error_count = 0
-            skipped_count = 0
-            for result in results:
-                if result is True:
-                    success_count += 1
-                elif result is False:
-                    error_count += 1
-                elif result is None:
-                    skipped_count += 1
-                elif isinstance(result, Exception):
-                    print(f"Task failed with exception: {result}")
-                    error_count += 1
+            print(f"Found {len(component_dirs)} potential Maven component directories.")
             
-            
+            # Track skipped SNAPSHOT components
+            skipped_snapshots = []
+            valid_components = []
+
+            for comp_dir in component_dirs:
+                assets_in_dir = [p for p in asset_files if p.parent == comp_dir]
+                if not assets_in_dir:
+                    continue
+
+                # Prioritize POM for coordinates
+                pom_file = next((p for p in assets_in_dir if p.name.lower().endswith('.pom')), None)
+                group_id, artifact_id, version = None, None, None
+                if pom_file:
+                    group_id, artifact_id, version = parse_pom_file(pom_file)
+
+                # Fallback to path parsing if POM is missing or fails
+                if not all([group_id, artifact_id, version]):
+                    try:
+                        g, a, v, _ = parse_maven_path(assets_in_dir[0], source_directory)
+                        group_id = group_id or g
+                        artifact_id = artifact_id or a
+                        version = version or v
+                    except ValueError as e:
+                        print(f"Skipping directory {comp_dir} due to parsing error: {e}")
+                        continue
+                
+                if not all([group_id, artifact_id, version]):
+                    print(f"Skipping directory {comp_dir}: Could not determine Maven coordinates.")
+                    continue
+
+                # Skip SNAPSHOT versions
+                if version.endswith('-SNAPSHOT'):
+                    skipped_snapshots.append(f"{group_id}:{artifact_id}:{version}")
+                    print(f"Skipping SNAPSHOT component: {group_id}:{artifact_id}:{version}")
+                    continue
+                
+                valid_components.append((group_id, artifact_id, version, assets_in_dir))
+
+            # Display summary
             print(f"\n{'='*70}")
-            typer.secho("UPLOAD SUMMARY", fg=typer.colors.YELLOW, bold=True)
-            print(f"Upload completed: {success_count} successful, {error_count} failed, {skipped_count} skipped")
-            print(f"Expected to upload: {effective_files},Expected to skip: {len(hash_files)}")
+            typer.secho("COMPONENT ANALYSIS", fg=typer.colors.YELLOW, bold=True)
+            print(f"  - Total component directories: {len(component_dirs)}")
+            print(f"  - Valid RELEASE components: {len(valid_components)}")
+            print(f"  - Skipped SNAPSHOT components: {len(skipped_snapshots)}")
+            if skipped_snapshots:
+                print(f"  - Skipped SNAPSHOTs:")
+                for snapshot in skipped_snapshots:
+                    print(f"    • {snapshot}")
+                typer.secho("    NOTE: SNAPSHOT packages require Maven deploy protocol, not REST API.", fg=typer.colors.YELLOW)
             print(f"{'='*70}")
-        except Exception as e:
-            print(f"Batch upload failed: {e}")
-            raise
+            
+            if not valid_components:
+                print("No valid RELEASE components to upload.")
+                return
+            
+            input(f"\nUploading {len(valid_components)} RELEASE components. Press Enter to continue...")
+
+            for group_id, artifact_id, version, assets_in_dir in valid_components:
+                tasks.append(asyncio.create_task(
+                    upload_maven_component_group(session, repo_url, group_id, artifact_id, version, assets_in_dir)
+                ))
+        else:
+            # For other formats, upload one by one
+            input(f"Uploading {len(asset_files)} files individually. Press Enter to continue...")
+            for asset_path in asset_files:
+                tasks.append(asyncio.create_task(
+                    upload_generic_component(session, repo_url, repo_format, asset_path)
+                ))
+
+        print(f"Created {len(tasks)} upload tasks.")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        success_count = sum(1 for r in results if r is True)
+        error_count = sum(1 for r in results if r is False or isinstance(r, Exception))
+        
+        typer.secho("UPLOAD SUMMARY", fg=typer.colors.YELLOW, bold=True)
+        print(f"- Upload tasks: {success_count} successful, {error_count} failed.")
+        print(f"- Expected to upload: {len(asset_files)} asset files.{len(tasks)} upload tasks.")
+        print(f"- Expected to skip: {len(hash_files)} hash files. {len(skipped_snapshots)} SNAPSHOT components.")
+
+async def upload_maven_component_group(session, repo_url, group_id, artifact_id, version, assets):
+    print(f"\n=== Uploading RELEASE component: {group_id}:{artifact_id}:{version} ===")
+    print(f"All files in this group: {[a.name for a in assets]}")
+    
+    # Filter out hash files that shouldn't be uploaded as assets
+    filtered_assets = []
+    for asset in assets:
+        filename = asset.name.lower()
+        if any(filename.endswith(ext) for ext in ['.md5', '.sha1', '.sha256', '.sha512', '.asc']):
+            print(f"Skipping hash file: {asset.name}")
+        else:
+            filtered_assets.append(asset)
+    
+    if not filtered_assets:
+        print("No assets to upload after filtering hash files")
+        return True
+        
+    print(f"Assets to upload: {[a.name for a in filtered_assets]}")
+    
+    data = aiohttp.FormData()
+    data.add_field("maven2.groupId", group_id)
+    data.add_field("maven2.artifactId", artifact_id)
+    data.add_field("maven2.version", version)
+    
+    # Track coordinates to detect duplicates
+    coordinates_seen = set()
+
+    for i, asset_path in enumerate(filtered_assets, 1):
+        clean_filename = asset_path.name
+        extension, classifier = "", ""
+        
+        # Extract classifier and extension from filename (RELEASE versions only)
+        pattern = f"^{re.escape(artifact_id)}-{re.escape(version)}(?:-(.*))?\.(.*)$"
+        match = re.match(pattern, clean_filename)
+        if match:
+            classifier, extension = match.groups()
+            classifier = classifier or ""
+        else:
+            # Fallback parsing
+            if '.' in clean_filename:
+                parts = clean_filename.rsplit('.', 1)
+                extension = parts[1]
+                classifier = ""
+
+        # Create coordinate tuple for duplicate detection
+        coordinate = (extension, classifier)
+        if coordinate in coordinates_seen:
+            print(f"WARNING: Duplicate coordinates detected! Asset {i} ({clean_filename}) has same coordinates as previous asset: extension='{extension}', classifier='{classifier}'")
+        else:
+            coordinates_seen.add(coordinate)
+        
+        print(f"Asset {i}: {clean_filename} -> extension='{extension}', classifier='{classifier}' (coordinate: {coordinate})")
+        
+        data.add_field(f"maven2.asset{i}.extension", extension)
+        if classifier:
+            data.add_field(f"maven2.asset{i}.classifier", classifier)
+        
+        file_handle = open(asset_path, "rb")
+        data.add_field(f"maven2.asset{i}", file_handle, filename=asset_path.name, content_type="application/octet-stream")
+
+    try:
+        async with session.post(repo_url, data=data) as response:
+            if response.status == 204:
+                print(f"Successfully uploaded component {group_id}:{artifact_id}:{version}")
+                return True
+            else:
+                error_text = await response.text()
+                print(f"Failed to upload {group_id}:{artifact_id}:{version}. Status: {response.status}, Error: {error_text}")
+                return False
+    except aiohttp.ClientError as e:
+        print(f"Network error uploading {group_id}:{artifact_id}:{version}: {e}")
+        return False
+    finally:
+        for field in data._fields:
+            if isinstance(field[2], aiohttp.payload.IOBasePayload):
+                field[2].value.close()
+
+async def upload_generic_component(session, repo_url, repo_format, asset_path):
+    data = aiohttp.FormData()
+    with open(asset_path, "rb") as file_handle:
+        data.add_field(f"{repo_format}.asset", file_handle, filename=asset_path.name)
+        try:
+            async with session.post(repo_url, data=data) as response:
+                if response.status == 204:
+                    print(f"Successfully uploaded {asset_path.name}")
+                    return True
+                else:
+                    print(f"Failed to upload {asset_path.name}: {response.status}")
+                    return False
+        except aiohttp.ClientError as e:
+            print(f"Network error uploading {asset_path.name}: {e}")
+            return False
